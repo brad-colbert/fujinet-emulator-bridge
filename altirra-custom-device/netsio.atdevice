@@ -54,6 +54,8 @@ int block_dev1;
 int block_dev2;
 int skip_current_command;
 int hsio_pending;
+int hsio_active;    // Atari at an HSIO rate that is being translated locally, FujiNet-PC not told
+int fn_baud;        // FujiNet-PC's own rate, from its last speed change ($80) event
 int ext_clock_enabled;
 
 Thread command_thread;
@@ -137,7 +139,7 @@ function void debug_command_frame()
         else if(cmd == $C6) Debug.log("Fuji HASH LENGTH");
         else if(cmd == $C5) Debug.log_int("Fuji HASH OUTPUT ", aux);
         else if(cmd == $53) Debug.log("Fuji STATUS");
-        else if(cmd == $3F) Debug.log("Fuji GET HSIO");
+        else if(cmd == $3F) {Debug.log("Fuji GET HSIO"); hsio_pending = 1;}
         else Debug.log_int("Fuji CMD ", cmd);
     }
     else if (devID >= $71 && devID <= $78)
@@ -452,22 +454,32 @@ function void rxbyte_thread_handler()
         rxbyte = $sio.recv_raw_byte();
         //$network.post_message($103, 2); // debug nop
         if (out_cpb != $aux) {
-            if (hsio_pending) {
+            //baud = 1789773 / $aux;
+            baud = 1789760 / $aux;
+            // Only a switch to a rate FujiNet-PC is not running at needs hiding; same
+            // tolerance FujiNet-PC applies before corrupting (NetSIO::handle_netsio).
+            // Keep the parentheses: the script compiler groups equal-precedence operators
+            // right to left (a * b / c is a * (b / c))
+            if (hsio_pending && (baud < (fn_baud * 90) / 100 || baud > (fn_baud * 110) / 100)) {
                 // HSIO negotiated — update both directions locally
                 // Do NOT send event $80 to FujiNet-PC (would cause data corruption)
                 buffer_to_server();
                 out_cpb = $aux;
                 in_cpb = $aux;
                 hsio_pending = 0;
-                baud = 1789760 / $aux;
+                hsio_active = 1;
                 Debug.log_int("HSIO active @ ", baud);
             } else {
                 Debug.log_int("CPB: ", $aux);
                 //$network.post_message($103, 3); // debug nop
                 buffer_to_server();
                 out_cpb = $aux;
-                //baud = 1789773 / $aux;
-                baud = 1789760 / $aux;
+                if (hsio_active) {
+                    // leaving the locally translated HSIO rate: send at FujiNet-PC's rate again
+                    hsio_active = 0;
+                    in_cpb = 1789760 / fn_baud;
+                    Debug.log_int("HSIO inactive, NetSIO to Atari @ ", fn_baud);
+                }
                 Debug.log_int("NetSIO from Atari @ ", baud);
                 $network.post_message($80, baud);
                 //$network.post_message($103, 4); // debug nop
@@ -571,9 +583,27 @@ event "network_interrupt": function
         // Thread.sleep(400); // yield workaround for 3.90
     }
     else if (evt == $80) {
-        //in_cpb = 1789773 / arg;
-        in_cpb = 1789760 / arg;
-        Debug.log_int("NetSIO to Atari @ ", arg);
+        if (hsio_active && arg == fn_baud) {
+            // FujiNet-PC re-announced its unchanged rate: keep translating the HSIO rate locally
+            Debug.log_int("HSIO active, FujiNet-PC @ ", arg);
+        } else {
+            //in_cpb = 1789773 / arg;
+            in_cpb = 1789760 / arg;
+            Debug.log_int("NetSIO to Atari @ ", arg);
+            if (hsio_active) {
+                // FujiNet-PC changed its rate (e.g. NetStream) during a locally translated HSIO
+                // switch: stop translating. If the Atari already sends at the new rate, report
+                // it now; FujiNet-PC still holds the pre-HSIO rate and would corrupt every byte
+                hsio_active = 0;
+                int atari_baud = 1789760 / out_cpb;
+                Debug.log("HSIO inactive");
+                if (atari_baud >= (arg * 90) / 100 && atari_baud <= (arg * 110) / 100) {
+                    Debug.log_int("NetSIO from Atari @ ", atari_baud);
+                    $network.post_message($80, atari_baud);
+                }
+            }
+        }
+        fn_baud = arg;
         if (ext_clock_enabled) {
             int period = 0;
             if (arg > 0) {
@@ -661,6 +691,8 @@ event "cold_reset": function
     block_dev2 = $6F; // $6F for PCLink, -1 to deactivate
     skip_current_command = 0;
     hsio_pending = 1;
+    hsio_active = 0;
+    fn_baud = 19200; // FujiNet-PC default, re-announced when it reconnects
 
     processing_pclink_parblk = 0;
 
